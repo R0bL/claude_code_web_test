@@ -11,6 +11,7 @@ Author: AllSci Data Pipeline
 """
 
 import sys
+import json
 from datetime import datetime
 from typing import Dict, Any
 
@@ -20,22 +21,28 @@ from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import (
-    col, current_timestamp, input_file_name, lit, to_json, struct
+    col, current_timestamp, input_file_name, lit, from_json,
+    regexp_extract, to_date
 )
 from pyspark.sql.types import (
-    StructType, StructField, StringType, IntegerType,
+    StructType, StructField, StringType, IntegerType, DateType,
     ArrayType, LongType, TimestampType
 )
 
-# Get job parameters
-args = getResolvedOptions(sys.argv, [
-    'JOB_NAME',
-    'landing_zone_bucket',
-    'bronze_bucket',
-    'environment',
-    'glue_database',
-    'fiscal_years'  # Comma-separated list of fiscal years
-])
+from utils.functions import (
+    read_json_from_s3,
+    write_json_to_s3
+)
+
+# Get job parameters - following AllSci convention-based naming
+try:
+    args = getResolvedOptions(sys.argv, ['JOB_NAME', 'ENV', 'FISCAL_YEARS'])
+    params_from_workflow = True
+except:
+    # Fallback for manual runs
+    args = getResolvedOptions(sys.argv, ['JOB_NAME', 'ENV'])
+    args['FISCAL_YEARS'] = '2024,2023'
+    params_from_workflow = False
 
 # Initialize Spark and Glue contexts
 sc = SparkContext()
@@ -44,23 +51,23 @@ spark: SparkSession = glue_context.spark_session
 job = Job(glue_context)
 job.init(args['JOB_NAME'], args)
 
+# Job configuration using convention-based naming
+ENV = args['ENV']
+LANDING_ZONE_BUCKET = f"allsci-landingzone-{ENV}"
+BRONZE_BUCKET = f"allsci-bronze-{ENV}"
+GLUE_DATABASE = f"allsci_{ENV}_nih_reporter_bronze"
+FISCAL_YEARS = [int(fy.strip()) for fy in args['FISCAL_YEARS'].split(',')]
+PIPELINE_VERSION = "1.0.0"
+
 # Enable Iceberg support
 spark.conf.set("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
 spark.conf.set("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
-spark.conf.set("spark.sql.catalog.glue_catalog.warehouse", f"s3://{args['bronze_bucket']}/")
+spark.conf.set("spark.sql.catalog.glue_catalog.warehouse", f"s3://{BRONZE_BUCKET}/")
 spark.conf.set("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
 spark.conf.set("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
 
-# Job configuration
-LANDING_ZONE_BUCKET = args['landing_zone_bucket']
-BRONZE_BUCKET = args['bronze_bucket']
-ENVIRONMENT = args['environment']
-GLUE_DATABASE = args['glue_database']
-FISCAL_YEARS = [int(fy.strip()) for fy in args['fiscal_years'].split(',')]
-PIPELINE_VERSION = "1.0.0"
-
 # Table configuration
-BRONZE_TABLE_NAME = "nih_reporter_projects_bronze"
+BRONZE_TABLE_NAME = "projects_metadata"
 BRONZE_TABLE_FULL_NAME = f"glue_catalog.{GLUE_DATABASE}.{BRONZE_TABLE_NAME}"
 
 
@@ -68,7 +75,7 @@ def main():
     """Main execution function."""
     try:
         print(f"Starting Bronze layer job for fiscal years: {FISCAL_YEARS}")
-        print(f"Environment: {ENVIRONMENT}")
+        print(f"Environment: {ENV}")
         print(f"Landing zone: s3://{LANDING_ZONE_BUCKET}")
         print(f"Bronze zone: s3://{BRONZE_BUCKET}")
 
@@ -84,6 +91,38 @@ def main():
             print(f"Processed {records_processed} records for FY{fiscal_year}")
 
         print(f"Bronze layer job completed successfully. Total records: {total_records}")
+        
+        # Update bronze control flag
+        print("\nUpdating NIH Reporter bronze flag file...")
+        try:
+            bronze_flag = read_json_from_s3(
+                LANDING_ZONE_BUCKET,
+                "control_flags/bronze/nih_reporter/flag.json"
+            )
+            if bronze_flag is None:
+                # Create initial flag structure
+                bronze_flag = {
+                    "job_name": "nih_reporter",
+                    "source_layer": "landing",
+                    "target_layer": "bronze",
+                    "batch_to_process": FISCAL_YEARS,
+                    "sources_last_updated_at": {}
+                }
+            else:
+                bronze_flag['batch_to_process'] = FISCAL_YEARS
+            
+            bronze_flag['last_updated_at'] = datetime.utcnow().isoformat()
+            
+            write_json_to_s3(
+                bronze_flag,
+                LANDING_ZONE_BUCKET,
+                "control_flags/bronze/nih_reporter/flag.json"
+            )
+            print("Bronze flag updated successfully")
+        except Exception as e:
+            print(f"Warning: Could not update bronze flag: {str(e)}")
+            # Don't fail the job if flag update fails
+        
         job.commit()
 
     except Exception as e:
@@ -95,8 +134,8 @@ def create_bronze_table_if_not_exists():
     """
     Create the bronze Iceberg table if it doesn't exist.
 
-    The bronze table uses a flexible schema that can accommodate all fields
-    from the NIH RePORTER API response.
+    The bronze table stores minimal metadata with the complete raw JSON object,
+    following the AllSci pattern for bronze layer tables.
     """
     # Check if table exists
     table_exists = spark.catalog._jcatalog.tableExists(GLUE_DATABASE, BRONZE_TABLE_NAME)
@@ -104,31 +143,21 @@ def create_bronze_table_if_not_exists():
     if not table_exists:
         print(f"Creating bronze table: {BRONZE_TABLE_FULL_NAME}")
 
-        # Create table with schema
-        # Using a flexible approach: store the entire JSON as a string
-        # plus extract key fields for partitioning and querying
+        # Create table with simplified schema following AllSci pattern
         create_table_sql = f"""
         CREATE TABLE IF NOT EXISTS {BRONZE_TABLE_FULL_NAME} (
-            -- Metadata fields
-            source_file STRING COMMENT 'Source S3 file path',
-            ingestion_timestamp TIMESTAMP COMMENT 'When data was ingested to landing zone',
-            processing_timestamp TIMESTAMP COMMENT 'When data was processed to bronze',
-            pipeline_version STRING COMMENT 'Pipeline version',
-
-            -- Key identifiers (extracted for indexing/partitioning)
-            fiscal_year INT COMMENT 'Fiscal year',
-            project_num STRING COMMENT 'Project/grant number',
-            appl_id BIGINT COMMENT 'Application ID',
-
-            -- Complete raw record as JSON string
-            raw_json STRING COMMENT 'Complete raw JSON record from API'
+            project_num STRING COMMENT 'Project/grant number (natural key)',
+            fiscal_year INT COMMENT 'Fiscal year for partitioning',
+            data_object STRING COMMENT 'Complete raw JSON data from API',
+            source_date DATE COMMENT 'Date when data was extracted from API',
+            ingestion_datetime TIMESTAMP COMMENT 'Timestamp when data was ingested into bronze'
         )
         USING iceberg
         PARTITIONED BY (fiscal_year)
-        LOCATION 's3://{BRONZE_BUCKET}/nih_reporter_projects/'
+        LOCATION 's3://{BRONZE_BUCKET}/nih_reporter/projects_metadata'
         TBLPROPERTIES (
             'write.format.default' = 'parquet',
-            'write.parquet.compression-codec' = 'snappy',
+            'write.parquet.compression-codec' = 'zstd',
             'format-version' = '2'
         )
         """
@@ -155,9 +184,8 @@ def process_fiscal_year(fiscal_year: int) -> int:
     print(f"Reading data from: {s3_path}")
 
     try:
-        # Read JSONL files
-        # Use multiLine=false for JSONL format (one JSON object per line)
-        df = spark.read.json(s3_path, multiLine=False)
+        # Read JSONL files as text
+        df = spark.read.text(s3_path)
 
         if df.count() == 0:
             print(f"No data found for fiscal year {fiscal_year}")
@@ -186,33 +214,42 @@ def process_fiscal_year(fiscal_year: int) -> int:
 
 def transform_to_bronze(df: DataFrame, fiscal_year: int) -> DataFrame:
     """
-    Transform raw DataFrame to bronze schema.
+    Transform raw JSONL text to bronze schema.
 
     Args:
-        df: Raw DataFrame from JSONL
+        df: Raw DataFrame with 'value' column containing JSONL text
         fiscal_year: Fiscal year being processed
 
     Returns:
-        Transformed DataFrame
+        Transformed DataFrame following AllSci bronze pattern
     """
-    # Add metadata columns
+    # Parse the JSON to extract project_num for indexing
+    from pyspark.sql.types import StructType, StructField
+    
+    # Define minimal schema to extract project_num
+    schema = StructType([
+        StructField("project_num", StringType(), True)
+    ])
+    
+    # Extract source_date from filename (format: projects_FY2024_YYYY-MM-DD_batch*.jsonl)
     bronze_df = df.select(
-        # Metadata
-        input_file_name().alias('source_file'),
-        col('_ingestion_metadata.ingestion_timestamp').cast(TimestampType()).alias('ingestion_timestamp'),
-        current_timestamp().alias('processing_timestamp'),
-        lit(PIPELINE_VERSION).alias('pipeline_version'),
-
-        # Key identifiers (extracted for partitioning/querying)
+        input_file_name().alias('filename'),
+        col('value').alias('data_object')
+    ).withColumn(
+        'source_date_str', 
+        regexp_extract('filename', r'_(\d{4}-\d{2}-\d{2})_', 1)
+    ).withColumn(
+        'source_date',
+        to_date('source_date_str')
+    ).withColumn(
+        'parsed',
+        from_json(col('data_object'), schema)
+    ).select(
+        col('parsed.project_num').alias('project_num'),
         lit(fiscal_year).alias('fiscal_year'),
-        col('project_num').cast(StringType()).alias('project_num'),
-        col('appl_id').cast(LongType()).alias('appl_id'),
-
-        # Complete raw record as JSON
-        # Convert entire row to JSON string to preserve ALL fields
-        to_json(struct(
-            [col(field) for field in df.columns if not field.startswith('_ingestion_metadata')]
-        )).alias('raw_json')
+        col('data_object'),
+        col('source_date'),
+        current_timestamp().alias('ingestion_datetime')
     )
 
     return bronze_df
@@ -239,34 +276,25 @@ def write_to_bronze_table(df: DataFrame):
     USING {temp_view} source
     ON target.project_num = source.project_num
        AND target.fiscal_year = source.fiscal_year
-       AND target.appl_id = source.appl_id
-    WHEN MATCHED THEN
+    WHEN MATCHED AND source.source_date > target.source_date THEN
         UPDATE SET
-            source_file = source.source_file,
-            ingestion_timestamp = source.ingestion_timestamp,
-            processing_timestamp = source.processing_timestamp,
-            pipeline_version = source.pipeline_version,
-            raw_json = source.raw_json
+            data_object = source.data_object,
+            source_date = source.source_date,
+            ingestion_datetime = source.ingestion_datetime
     WHEN NOT MATCHED THEN
         INSERT (
-            source_file,
-            ingestion_timestamp,
-            processing_timestamp,
-            pipeline_version,
-            fiscal_year,
             project_num,
-            appl_id,
-            raw_json
+            fiscal_year,
+            data_object,
+            source_date,
+            ingestion_datetime
         )
         VALUES (
-            source.source_file,
-            source.ingestion_timestamp,
-            source.processing_timestamp,
-            source.pipeline_version,
-            source.fiscal_year,
             source.project_num,
-            source.appl_id,
-            source.raw_json
+            source.fiscal_year,
+            source.data_object,
+            source.source_date,
+            source.ingestion_datetime
         )
     """
 

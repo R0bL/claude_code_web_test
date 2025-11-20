@@ -1,0 +1,11 @@
+# Placeholder for Lambda layer.zip
+# 
+# This file should be a real zip archive containing the python dependencies.
+# Build it using the instructions in BUILD_LAYER.md
+#
+# The layer will be created during deployment and should include:
+# - requests library and its dependencies
+#
+# Note: This placeholder exists so the CDK construct can reference it.
+# Replace with actual layer.zip before deploying.
+

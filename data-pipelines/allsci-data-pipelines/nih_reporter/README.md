@@ -32,11 +32,29 @@ The NIH RePORTER pipeline automates the extraction, transformation, and loading 
 - **Complete Field Coverage**: Captures ALL fields from the NIH RePORTER API v2 (100+ fields)
 - **Incremental Updates**: Upsert logic for efficient updates
 - **Scalable Architecture**: Processes millions of records using AWS Glue and Iceberg
-- **Star Schema Design**: Normalized dimension and fact tables for efficient querying
+- **3-Layer Architecture**: Landing → Bronze → Silver following AllSci standards
+- **Source-Specific Tables**: Silver layer with 11 normalized source tables
 - **Automated Scheduling**: Weekly updates via EventBridge
 - **Error Handling**: Comprehensive retry logic and error handling
 
 ## Architecture
+
+The NIH Reporter pipeline follows AllSci's standardized modular architecture with convention-based configuration and shared utilities.
+
+### Architecture Alignment
+
+This pipeline has been refactored to align with AllSci's architectural standards, addressing:
+
+1. **Modular CDK Constructs**: Separated into reusable constructs (Glue, Lambda, Step Functions, EventBridge)
+2. **Shared IAM Roles**: References `allsci-{ENV}-glue-default-service-role` (no new role creation)
+3. **Complete Package Structure**: Includes shared utilities (lake_tools, opensearch, postgresql, utils)
+4. **Glue 5.0**: Uses latest Glue version for performance and features
+5. **Job Bookmarks**: Enabled for incremental processing and preventing reprocessing
+6. **VPC Connections**: Configured with `allsci-{ENV}-network` for private resource access
+7. **Lambda Layers**: Packages dependencies in layer.zip for efficient deployments
+8. **Auto-scaling**: Enabled on Glue jobs for cost optimization
+9. **Standard Script Locations**: Uses AWS Glue assets bucket with consistent paths
+10. **Convention-based Configuration**: Environment-driven naming (ENV parameter only)
 
 ### Pipeline Components
 
@@ -60,18 +78,28 @@ The NIH RePORTER pipeline automates the extraction, transformation, and loading 
          │                       │                         │
          v                       v                         v
     Landing Zone              Bronze Zone             Silver Zone
-   (Raw JSONL)              (Iceberg Raw)        (Iceberg Star Schema)
+   (Raw JSONL)          (Iceberg data_object)   (11 Source Tables)
 ```
 
 ### Infrastructure
 
 - **Lambda Function**: Queries NIH RePORTER API, handles pagination and rate limiting
-- **Glue Bronze Job**: Reads JSONL, writes to Iceberg (preserves raw structure)
-- **Glue Silver Job**: Transforms into normalized star schema with 10 tables
+- **Glue Bronze Job**: Reads JSONL, writes to Iceberg (preserves raw JSON structure)
+- **Glue Silver Job**: Transforms into 11 normalized source-specific tables
 - **Step Functions**: Orchestrates Lambda → Bronze → Silver workflow
 - **EventBridge**: Schedules weekly pipeline execution
 - **S3 Buckets**: Landing zone, bronze, and silver data lakes
 - **Glue Data Catalog**: Metadata and schema management
+
+### Database Structure
+
+Following AllSci's 3-layer architecture:
+
+- **Bronze Database**: `allsci_{ENV}_nih_reporter_bronze`
+  - Table: `projects_metadata` (raw JSON data)
+- **Silver Database**: `allsci_{ENV}_nih_reporter_silver`
+  - 11 source-specific tables (see Schema Design below)
+- **Gold Layer**: Future work - dimensional model combining multiple grant sources
 
 ## Data Sources
 
@@ -100,57 +128,95 @@ The pipeline captures **ALL** available fields from the API. See [docs/api_field
 
 ## Schema Design
 
+### Bronze Layer
+
+**Database**: `allsci_{ENV}_nih_reporter_bronze`
+
+**projects_metadata** (Raw data table)
+- `project_num` (STRING): Project/grant number (natural key)
+- `fiscal_year` (INT): Fiscal year (partition key)
+- `data_object` (STRING): Complete raw JSON from API
+- `source_date` (DATE): Date when data was extracted
+- `ingestion_datetime` (TIMESTAMP): When ingested to bronze
+
 ### Silver Layer Tables
 
-#### Dimension Tables
+**Database**: `allsci_{ENV}_nih_reporter_silver`
 
-**dim_nih_projects** (Primary project dimension)
-- **Primary Key**: (project_num, fiscal_year)
-- **Attributes**: Title, dates, abstract, PI name, activity code
-- **Purpose**: Core project information
+Silver layer contains 11 source-specific tables that flatten and normalize the NIH Reporter API data. All tables use natural keys (project_num + fiscal_year) for relationships.
 
-**dim_nih_organizations** (Organizations/institutions)
-- **Primary Key**: org_key (hash of name+city+state)
-- **Attributes**: Name, location, DUNS, UEI, department type
-- **Purpose**: Organization master data
+#### Core Project Table
 
-**dim_nih_personnel** (PIs and Program Officers)
-- **Primary Key**: personnel_key
-- **Attributes**: Name, profile_id, role (PI/PO), contact PI flag
-- **Purpose**: Personnel master data
+**nih_reporter_projects** (Main project data)
+- **Natural Keys**: project_num, fiscal_year
+- **Attributes**: Project title, dates, abstract, public health relevance, activity code, funding amounts, CFDA code
+- **Partition**: fiscal_year
 
-**dim_nih_study_sections** (Study sections)
-- **Primary Key**: study_section_key
+#### Related Entity Tables
+
+**nih_reporter_organizations** (Organization details)
+- **Natural Keys**: org_key (md5 hash), project_num, fiscal_year
+- **Attributes**: Organization name, location, DUNS, UEI, FIPS code
+
+**nih_reporter_principal_investigators** (PIs, exploded from array)
+- **Natural Keys**: project_num, fiscal_year, profile_id
+- **Attributes**: Name fields, is_contact_pi flag
+- **Partition**: fiscal_year
+
+**nih_reporter_program_officers** (Program officers, exploded from array)
+- **Natural Keys**: project_num, fiscal_year, full_name
+- **Attributes**: Name fields
+- **Partition**: fiscal_year
+
+**nih_reporter_publications** (Publications, exploded from array)
+- **Natural Keys**: project_num, fiscal_year, pmid
+- **Attributes**: PMID, PMC ID
+- **Partition**: fiscal_year
+
+**nih_reporter_clinical_trials** (Clinical trials, exploded from array)
+- **Natural Keys**: project_num, fiscal_year, nct_id
+- **Attributes**: NCT ID
+- **Partition**: fiscal_year
+
+**nih_reporter_agencies_admin** (Admin IC)
+- **Natural Keys**: project_num, fiscal_year
+- **Attributes**: IC code, abbreviation, name
+- **Partition**: fiscal_year
+
+**nih_reporter_agencies_funding** (Funding ICs, exploded from array)
+- **Natural Keys**: project_num, fiscal_year, ic_code
+- **Attributes**: IC code, abbreviation, name
+- **Partition**: fiscal_year
+
+**nih_reporter_spending_categories** (Spending categories, exploded from array)
+- **Natural Keys**: project_num, fiscal_year, category_name
+- **Attributes**: Category name
+- **Partition**: fiscal_year
+
+**nih_reporter_terms** (Research terms, exploded from array)
+- **Natural Keys**: project_num, fiscal_year, term_text
+- **Attributes**: Term text
+- **Partition**: fiscal_year
+
+**nih_reporter_study_sections** (Study section details)
+- **Natural Keys**: project_num, fiscal_year
 - **Attributes**: SRG codes, study section name
-- **Purpose**: Review group information
-
-**dim_nih_agencies** (NIH Institutes/Centers)
-- **Primary Key**: agency_key
-- **Attributes**: IC code, abbreviation, name, type (admin/funding)
-- **Purpose**: NIH IC master data
-
-#### Fact Tables
-
-**fact_nih_funding** (Funding events - main fact table)
-- **Primary Key**: (project_num, fiscal_year)
-- **Foreign Keys**: org_key, admin_ic_key
-- **Measures**: award_amount, direct_cost_amt, indirect_cost_amt, total_cost
-- **Attributes**: Budget dates, award type, ARRA flag, CFDA code
-
-#### Bridge Tables (Many-to-Many Relationships)
-
-- **bridge_nih_publications**: Links projects to PubMed publications
-- **bridge_nih_clinical_trials**: Links projects to clinical trials
-- **bridge_nih_spending_categories**: Links projects to spending categories
-- **bridge_nih_terms**: Links projects to research terms
+- **Partition**: fiscal_year
 
 ### Data Lineage
 
 ```
-Raw API JSON (Landing)
-    └─> Bronze Layer (Complete raw data preserved as JSON + key fields)
-        └─> Silver Layer (Normalized star schema with 10 tables)
+Landing Zone (Raw JSONL with source_date)
+    └─> Bronze Layer (project_num, fiscal_year, data_object, source_date)
+        └─> Silver Layer (11 normalized source tables with natural keys)
+            └─> Gold Layer (Future: dimensional model with AllSci IDs)
 ```
+
+### Notes on Architecture
+
+- **Silver = Source Tables**: Silver layer preserves NIH Reporter-specific structure with natural keys
+- **No AllSci IDs in Silver**: AllSci standardized IDs (ASC-GR-*) will be generated in Gold layer
+- **Gold Layer (Future)**: Will combine NIH Reporter with other grant sources (NSF, private foundations) into unified dimensional model with `dim_grant` and `fact_grant_funding` tables
 
 ## Installation
 
@@ -196,13 +262,22 @@ make deploy ENV=prod
 
 ### What Gets Deployed
 
-- Lambda function: `nih-reporter-ingestion-{ENV}`
-- Glue bronze job: `nih-reporter-bronze-{ENV}`
-- Glue silver job: `nih-reporter-silver-{ENV}`
-- Step Functions: `nih-reporter-pipeline-{ENV}`
-- EventBridge rule: `nih-reporter-weekly-schedule-{ENV}`
-- IAM roles and policies
-- CloudWatch log groups
+The deployment creates a modular infrastructure using separate CDK constructs:
+
+- **Lambda Function**: `{ENV}_allsci_nih_reporter_trigger`
+  - Python 3.11 runtime with Lambda layer
+  - 15-minute timeout, 1024 MB memory
+  - 5 concurrent executions max
+- **Glue Jobs**: 
+  - Bronze: `{ENV}_nih_reporter_bronze` (Glue 5.0, G.1X workers, VPC-enabled)
+  - Silver: `{ENV}_nih_reporter_silver` (Glue 5.0, G.1X workers, VPC-enabled)
+  - Both use shared IAM role: `allsci-{ENV}-glue-default-service-role`
+  - Job bookmarks enabled for incremental processing
+- **Step Functions**: `nih-reporter-pipeline-{ENV}` (orchestrates Lambda → Bronze → Silver)
+- **EventBridge**: `nih-reporter-weekly-{ENV}` (Sunday 2 AM UTC schedule)
+- **CloudWatch Log Groups**: `/aws/vendedlogs/states/nih-reporter-{ENV}`
+
+All resources follow AllSci naming conventions and reuse shared infrastructure.
 
 ## Usage
 
@@ -259,14 +334,14 @@ aws stepfunctions list-executions \
 
 ### Using Athena
 
-Connect to the Glue Data Catalog and query using Athena:
+Connect to the Glue Data Catalog and query using Athena. Note that queries use the **Silver layer** database with source-specific tables.
 
 #### Basic Project Counts
 
 ```sql
 -- Total projects by fiscal year
 SELECT fiscal_year, COUNT(*) as project_count
-FROM allsci_dev.dim_nih_projects
+FROM allsci_dev_nih_reporter_silver.nih_reporter_projects
 GROUP BY fiscal_year
 ORDER BY fiscal_year DESC;
 ```
@@ -278,12 +353,16 @@ ORDER BY fiscal_year DESC;
 SELECT
     o.org_name,
     o.org_state,
-    COUNT(DISTINCT f.project_num) as project_count,
-    SUM(f.award_amount) as total_funding
-FROM allsci_dev.fact_nih_funding f
-JOIN allsci_dev.dim_nih_organizations o ON f.org_key = o.org_key
-WHERE f.fiscal_year = 2024
-GROUP BY o.org_name, o.org_state
+    o.org_city,
+    COUNT(DISTINCT p.project_num) as project_count,
+    SUM(p.award_amount) as total_funding,
+    AVG(p.award_amount) as avg_award
+FROM allsci_dev_nih_reporter_silver.nih_reporter_projects p
+JOIN allsci_dev_nih_reporter_silver.nih_reporter_organizations o 
+    ON p.project_num = o.project_num 
+    AND p.fiscal_year = o.fiscal_year
+WHERE p.fiscal_year = 2024
+GROUP BY o.org_name, o.org_state, o.org_city
 ORDER BY total_funding DESC
 LIMIT 20;
 ```
@@ -293,23 +372,20 @@ LIMIT 20;
 ```sql
 -- Top PIs by publication count
 SELECT
-    p.full_name,
-    p.role_type,
-    COUNT(DISTINCT proj.project_num) as project_count,
+    pi.full_name,
+    pi.is_contact_pi,
+    COUNT(DISTINCT p.project_num) as project_count,
     COUNT(DISTINCT pub.pmid) as publication_count,
-    SUM(f.award_amount) as total_funding
-FROM allsci_dev.dim_nih_personnel p
-JOIN allsci_dev.dim_nih_projects proj
-    ON p.project_num = proj.project_num
-    AND p.fiscal_year = proj.fiscal_year
-JOIN allsci_dev.fact_nih_funding f
-    ON proj.project_num = f.project_num
-    AND proj.fiscal_year = f.fiscal_year
-LEFT JOIN allsci_dev.bridge_nih_publications pub
-    ON proj.project_num = pub.project_num
-    AND proj.fiscal_year = pub.fiscal_year
-WHERE p.fiscal_year = 2024 AND p.role_type = 'PI'
-GROUP BY p.full_name, p.role_type
+    SUM(p.award_amount) as total_funding
+FROM allsci_dev_nih_reporter_silver.nih_reporter_principal_investigators pi
+JOIN allsci_dev_nih_reporter_silver.nih_reporter_projects p
+    ON pi.project_num = p.project_num
+    AND pi.fiscal_year = p.fiscal_year
+LEFT JOIN allsci_dev_nih_reporter_silver.nih_reporter_publications pub
+    ON p.project_num = pub.project_num
+    AND p.fiscal_year = pub.fiscal_year
+WHERE pi.fiscal_year = 2024
+GROUP BY pi.full_name, pi.is_contact_pi
 HAVING publication_count > 0
 ORDER BY publication_count DESC
 LIMIT 50;
@@ -321,12 +397,12 @@ LIMIT 50;
 -- Most common research terms
 SELECT
     t.term_text,
-    COUNT(DISTINCT t.project_num) as project_count,
-    SUM(f.award_amount) as total_funding
-FROM allsci_dev.bridge_nih_terms t
-JOIN allsci_dev.fact_nih_funding f
-    ON t.project_num = f.project_num
-    AND t.fiscal_year = f.fiscal_year
+    COUNT(DISTINCT p.project_num) as project_count,
+    SUM(p.award_amount) as total_funding
+FROM allsci_dev_nih_reporter_silver.nih_reporter_terms t
+JOIN allsci_dev_nih_reporter_silver.nih_reporter_projects p
+    ON t.project_num = p.project_num
+    AND t.fiscal_year = p.fiscal_year
 WHERE t.fiscal_year = 2024
 GROUP BY t.term_text
 ORDER BY project_count DESC
@@ -336,16 +412,18 @@ LIMIT 100;
 #### Institute/Center Funding Distribution
 
 ```sql
--- Funding by NIH Institute/Center
+-- Funding by NIH Institute/Center (Admin IC)
 SELECT
     a.ic_abbreviation,
     a.ic_name,
-    COUNT(DISTINCT f.project_num) as project_count,
-    SUM(f.award_amount) as total_awards,
-    AVG(f.award_amount) as avg_award
-FROM allsci_dev.fact_nih_funding f
-JOIN allsci_dev.dim_nih_agencies a ON f.admin_ic_key = a.agency_key
-WHERE f.fiscal_year = 2024 AND a.agency_type = 'admin'
+    COUNT(DISTINCT p.project_num) as project_count,
+    SUM(p.award_amount) as total_awards,
+    AVG(p.award_amount) as avg_award
+FROM allsci_dev_nih_reporter_silver.nih_reporter_agencies_admin a
+JOIN allsci_dev_nih_reporter_silver.nih_reporter_projects p
+    ON a.project_num = p.project_num
+    AND a.fiscal_year = p.fiscal_year
+WHERE a.fiscal_year = 2024
 GROUP BY a.ic_abbreviation, a.ic_name
 ORDER BY total_awards DESC;
 ```
@@ -355,19 +433,17 @@ ORDER BY total_awards DESC;
 ```sql
 -- Projects with clinical trials
 SELECT
-    proj.project_title,
-    proj.project_num,
+    p.project_title,
+    p.project_num,
     ct.nct_id,
-    f.award_amount
-FROM allsci_dev.dim_nih_projects proj
-JOIN allsci_dev.bridge_nih_clinical_trials ct
-    ON proj.project_num = ct.project_num
-    AND proj.fiscal_year = ct.fiscal_year
-JOIN allsci_dev.fact_nih_funding f
-    ON proj.project_num = f.project_num
-    AND proj.fiscal_year = f.fiscal_year
-WHERE proj.fiscal_year = 2024
-ORDER BY f.award_amount DESC;
+    p.award_amount
+FROM allsci_dev_nih_reporter_silver.nih_reporter_projects p
+JOIN allsci_dev_nih_reporter_silver.nih_reporter_clinical_trials ct
+    ON p.project_num = ct.project_num
+    AND p.fiscal_year = ct.fiscal_year
+WHERE p.fiscal_year = 2024
+ORDER BY p.award_amount DESC
+LIMIT 100;
 ```
 
 ### Using PySpark (Glue Notebooks)
@@ -380,10 +456,20 @@ spark = SparkSession.builder \
     .config("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog") \
     .getOrCreate()
 
-# Query projects
+# Query projects from Silver layer
 projects_df = spark.sql("""
-    SELECT * FROM glue_catalog.allsci_dev.dim_nih_projects
+    SELECT * 
+    FROM glue_catalog.allsci_dev_nih_reporter_silver.nih_reporter_projects
     WHERE fiscal_year = 2024
+""")
+
+# Join with organizations
+projects_with_orgs = spark.sql("""
+    SELECT p.*, o.org_name, o.org_city, o.org_state
+    FROM glue_catalog.allsci_dev_nih_reporter_silver.nih_reporter_projects p
+    JOIN glue_catalog.allsci_dev_nih_reporter_silver.nih_reporter_organizations o
+        ON p.project_num = o.project_num AND p.fiscal_year = o.fiscal_year
+    WHERE p.fiscal_year = 2024
 """)
 
 projects_df.show()

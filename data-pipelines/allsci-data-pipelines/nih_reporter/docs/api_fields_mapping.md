@@ -28,30 +28,30 @@ Based on API exploration and documentation review, the following fields are avai
 
 | API Field Name | Data Type | Description | Silver Table | Silver Column |
 |----------------|-----------|-------------|--------------|---------------|
-| `appl_id` | Integer | Application ID | dim_nih_projects | appl_id |
-| `subproject_id` | Integer/String | Subproject ID (for multi-project awards) | dim_nih_projects | subproject_id |
-| `project_num` | String | Full project/grant number | dim_nih_projects | project_num |
-| `project_serial_num` | String | Serial number portion of project number | dim_nih_projects | project_serial_num |
-| `project_num_split` | Object | Parsed components of project number | dim_nih_projects | project_num_split_json |
-| `core_project_num` | String | Core project number | dim_nih_projects | core_project_num |
+| `appl_id` | Integer | Application ID | dim_nih_grants | appl_id |
+| `subproject_id` | Integer/String | Subproject ID (for multi-project awards) | dim_nih_grants | subproject_id |
+| `project_num` | String | Full project/grant number | dim_nih_grants | project_num |
+| `project_serial_num` | String | Serial number portion of project number | dim_nih_grants | project_serial_num |
+| `project_num_split` | Object | Parsed components of project number | dim_nih_grants | project_num_split_json |
+| `core_project_num` | String | Core project number | dim_nih_grants | core_project_num |
 | `fiscal_year` | Integer | Fiscal year of award | fact_nih_funding | fiscal_year |
-| `project_title` | String | Project title | dim_nih_projects | project_title |
-| `project_start_date` | String (Date) | Project start date | dim_nih_projects | project_start_date |
-| `project_end_date` | String (Date) | Project end date | dim_nih_projects | project_end_date |
+| `project_title` | String | Project title | dim_nih_grants | project_title |
+| `project_start_date` | String (Date) | Project start date | dim_nih_grants | project_start_date |
+| `project_end_date` | String (Date) | Project end date | dim_nih_grants | project_end_date |
 | `budget_start` | String (Date) | Budget period start date | fact_nih_funding | budget_start_date |
 | `budget_end` | String (Date) | Budget period end date | fact_nih_funding | budget_end_date |
 | `award_type` | String | Type of award | fact_nih_funding | award_type |
-| `activity_code` | String | NIH activity code | dim_nih_projects | activity_code |
+| `activity_code` | String | NIH activity code | dim_nih_grants | activity_code |
 | `award_notice_date` | String (Date) | Date award was issued | fact_nih_funding | award_notice_date |
 
 ### 2. TEXTUAL CONTENT
 
 | API Field Name | Data Type | Description | Silver Table | Silver Column |
 |----------------|-----------|-------------|--------------|---------------|
-| `abstract_text` | String | Project abstract | dim_nih_projects | abstract_text |
-| `project_detail_url` | String | URL to project details on RePORTER | dim_nih_projects | project_detail_url |
-| `phr_text` | String | Public health relevance statement | dim_nih_projects | phr_text |
-| `all_text` | String | Combined searchable text | dim_nih_projects | all_text |
+| `abstract_text` | String | Project abstract | dim_nih_grants | abstract_text |
+| `project_detail_url` | String | URL to project details on RePORTER | dim_nih_grants | project_detail_url |
+| `phr_text` | String | Public health relevance statement | dim_nih_grants | phr_text |
+| `all_text` | String | Combined searchable text | dim_nih_grants | all_text |
 | `terms` | String/Array | Research terms/keywords | bridge_nih_terms | term_text |
 
 ### 3. ORGANIZATION INFORMATION
@@ -82,7 +82,7 @@ Based on API exploration and documentation review, the following fields are avai
 | `principal_investigators[].last_name` | String | Last name | dim_nih_personnel | last_name |
 | `principal_investigators[].is_contact_pi` | Boolean | Is contact PI flag | dim_nih_personnel | is_contact_pi |
 | `principal_investigators[].full_name` | String | Full name | dim_nih_personnel | full_name |
-| `contact_pi_name` | String | Contact PI name (denormalized) | dim_nih_projects | contact_pi_name |
+| `contact_pi_name` | String | Contact PI name (denormalized) | dim_nih_grants | contact_pi_name |
 | `program_officers` | Array | List of program officers | dim_nih_personnel | - |
 | `program_officers[].first_name` | String | First name | dim_nih_personnel | first_name |
 | `program_officers[].middle_name` | String | Middle name | dim_nih_personnel | middle_name |
@@ -134,7 +134,7 @@ Based on API exploration and documentation review, the following fields are avai
 | `publications` | Array | List of publications | bridge_nih_publications | - |
 | `publications[].pmid` | Integer | PubMed ID | bridge_nih_publications | pmid |
 | `publications[].pmc_id` | String | PubMed Central ID | bridge_nih_publications | pmc_id |
-| `publication_count` | Integer | Total publication count | dim_nih_projects | publication_count |
+| `publication_count` | Integer | Total publication count | dim_nih_grants | publication_count |
 
 ### 9. CLINICAL TRIALS
 
@@ -163,9 +163,11 @@ Based on API exploration and documentation review, the following fields are avai
 
 ### Dimension Tables
 
-#### `dim_nih_projects`
+#### `dim_nih_grants`
 Primary dimension table for project core attributes.
-- **Primary Key**: `project_num`, `fiscal_year`
+- **Primary Key**: `allsci_id` (AllSci Grant ID: ASC-GR-{sequence}-1.0-{timestamp})
+- **Natural Keys**: `project_num`, `fiscal_year`
+- **Sequence Tracking**: `allsci_id_numeric_part`
 - **Attributes**: All project-level fields from section 1, 2, plus denormalized contact_pi_name
 
 #### `dim_nih_organizations`
@@ -192,8 +194,12 @@ NIH Institute/Center dimension.
 
 #### `fact_nih_funding`
 Main fact table for award/funding events.
-- **Primary Key**: `project_num`, `fiscal_year`
-- **Foreign Keys**: References to dimension tables
+- **Primary Key**: `funding_key`
+- **Foreign Keys**: 
+  - `grant_allsci_id` -> dim_nih_grants.allsci_id
+  - `org_key` -> dim_nih_organizations.org_key
+  - `admin_ic_key` -> dim_nih_agencies.agency_key
+- **Natural Keys**: `project_num`, `fiscal_year`
 - **Measures**: award_amount, direct_cost_amt, indirect_cost_amt, total_cost
 - **Attributes**: Dates, award type, funding mechanism
 
@@ -226,10 +232,10 @@ Many-to-many relationship between projects and research terms.
 
 ### Get all projects for an organization
 ```sql
-SELECT p.*, f.*
-FROM dim_nih_projects p
-JOIN fact_nih_funding f ON p.project_num = f.project_num AND p.fiscal_year = f.fiscal_year
-JOIN dim_nih_organizations o ON p.org_id = o.org_id
+SELECT g.*, f.*
+FROM dim_nih_grants g
+JOIN fact_nih_funding f ON g.allsci_id = f.grant_allsci_id
+JOIN dim_nih_organizations o ON f.org_key = o.org_key
 WHERE o.org_name = 'UNIVERSITY OF CALIFORNIA, SAN FRANCISCO'
 AND f.fiscal_year = 2024;
 ```

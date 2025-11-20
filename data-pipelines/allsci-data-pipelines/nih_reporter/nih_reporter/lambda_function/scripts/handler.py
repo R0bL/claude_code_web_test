@@ -328,21 +328,18 @@ def save_batch_to_s3(
     Raises:
         ClientError: If S3 upload fails
     """
-    # Generate S3 key
-    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-    s3_key = f"nih_reporter/projects/projects_FY{fiscal_year}_batch{batch_num:04d}_{timestamp}.jsonl"
+    # Generate S3 key with source_date for tracking data freshness
+    now = datetime.utcnow()
+    source_date = now.strftime('%Y-%m-%d')
+    timestamp = now.strftime('%H%M%S')
+    s3_key = f"nih_reporter/projects/projects_FY{fiscal_year}_{source_date}_batch{batch_num:04d}_{timestamp}.jsonl"
 
     try:
         # Convert to JSONL format
         jsonl_buffer = StringIO()
         for record in results:
-            # Add ingestion metadata to each record
-            record['_ingestion_metadata'] = {
-                'ingestion_timestamp': datetime.utcnow().isoformat(),
-                'fiscal_year': fiscal_year,
-                'batch_number': batch_num,
-                'source': 'nih_reporter_api_v2'
-            }
+            # Note: We don't add ingestion metadata here anymore
+            # The data_object in Bronze should be the pure API response
             jsonl_buffer.write(json.dumps(record) + '\n')
 
         # Upload to S3
