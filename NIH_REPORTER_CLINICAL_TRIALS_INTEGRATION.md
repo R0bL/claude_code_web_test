@@ -1,595 +1,477 @@
-# NIH Reporter → Clinical Trials Integration Guide
+# NIH Reporter → Clinical Trials Integration Guide (CORRECTED)
 
 ## Executive Summary
 
-The NIH Reporter API already provides **NCT IDs** (ClinicalTrials.gov identifiers) that link NIH-funded research projects to their associated clinical trials. This document explains how these identifiers are currently captured and how to use them to pull comprehensive clinical trial data from ClinicalTrials.gov.
+**CORRECTION**: The NIH Reporter Projects API **does NOT directly provide** clinical trials data in the project responses. Instead, the link between NIH-funded projects and clinical trials comes from a **separate data source: NIH ExPORTER Clinical Studies files**.
 
-## Current Implementation Status
+This document explains:
+1. Why the `clinical_trials` field in your pipeline code may not work
+2. The correct approach using NIH ExPORTER Clinical Studies downloads
+3. How to build a pipeline that links projects to clinical trials via `core_project_num`
 
-### ✅ What's Already Working
+---
 
-Your NIH Reporter pipeline **already captures NCT IDs** in the silver layer:
+## Problem: The `clinical_trials` Field May Not Exist
 
-**Table**: `nih_reporter_clinical_trials`
-**Location**: `allsci_silver_{ENV}/nih_reporter_clinical_trials`
-**Schema**:
-- `project_num` (String) - NIH project number
-- `fiscal_year` (Integer) - Fiscal year
-- `nct_id` (String) - **ClinicalTrials.gov NCT identifier**
-- `source_date` (Date) - Data freshness timestamp
-- `ingestion_datetime` (Timestamp) - ETL timestamp
+### Current Pipeline Code Assumption
 
-**Data Source**: The Lambda function queries NIH Reporter API and receives:
-```json
+Your pipeline includes a `NihReporterClinicalTrials` transformation class (lines 391-433 in `transformations.py`) that expects:
+
+```python
 {
   "project_num": "5R01CA123456-05",
   "fiscal_year": 2024,
   "clinical_trials": [
-    {"nct_id": "NCT04267848"},
-    {"nct_id": "NCT03892345"}
+    {"nct_id": "NCT04267848"}  # ← This field may not exist in API response
   ]
 }
 ```
 
-The silver Glue job (lines 391-433 in `transformations.py`) explodes this array into individual rows.
+### Reality Check
+
+After investigating the NIH Reporter API v2, the `clinical_trials` array field **may not be present** in the Projects API response. The pipeline code was likely built with the expectation that this field would be available, but it appears this data is provided through a **different mechanism**.
 
 ---
 
-## The Link: How NIH Reporter Connects to Clinical Trials
+## The Correct Approach: NIH ExPORTER Clinical Studies Files
 
-### Data Flow
+### How the Linkage Actually Works
+
+1. **Investigators enter grant numbers** when registering trials on ClinicalTrials.gov
+2. **ClinicalTrials.gov provides a feed** to NIH with grant numbers → NCT ID mappings
+3. **NIH ExPORTER** publishes this linkage data as **bulk CSV files**
+4. The linkage uses **`CORE_PROJECT_NUM`** (not `project_num`)
+
+### Data Flow Diagram
 
 ```
-NIH Reporter API
+ClinicalTrials.gov (NCT entries with NIH grant numbers)
     ↓
-  clinical_trials[] field contains NCT IDs
+  Feed to NIH
     ↓
-  nih_reporter_clinical_trials table (CURRENT)
+NIH ExPORTER Clinical Studies CSV
+    ├─ CORE_PROJECT_NUM
+    └─ NCT_ID (or similar field name)
     ↓
-  NCT ID → ClinicalTrials.gov API (FUTURE ENHANCEMENT)
+  Join with NIH Reporter Projects
+    (on core_project_num)
+    ↓
+  Use NCT_ID to query ClinicalTrials.gov API v2
     ↓
   Detailed Clinical Trial Data
 ```
 
-### Example Connection
+---
 
-```sql
--- Current data in your silver layer
-SELECT
-    project_num,
-    nct_id
-FROM allsci_silver_prod.nih_reporter_clinical_trials
-WHERE project_num = '5R01CA123456-05';
-```
+## NIH ExPORTER Clinical Studies File
 
-**Result**:
-| project_num | nct_id |
-|-------------|--------|
-| 5R01CA123456-05 | NCT04267848 |
-| 5R01CA123456-05 | NCT03892345 |
+### Download Location
+
+**URL**: `https://reporter.nih.gov/exporter` (navigate to Clinical Studies section)
+
+Or programmatically from ExPORTER bulk download endpoints.
+
+### File Format
+
+- **Format**: CSV
+- **Update Frequency**: Weekly (typically)
+- **Size**: Varies (likely 10-50 MB)
+
+### Expected Schema
+
+Based on NIH documentation, the Clinical Studies CSV file contains at minimum:
+
+| Field Name | Data Type | Description |
+|------------|-----------|-------------|
+| `CORE_PROJECT_NUM` | String | Core project number (links to NIH projects) |
+| `CLINICALTRIALS_GOV_ID` or `NCT_ID` | String | ClinicalTrials.gov NCT identifier |
+| Additional fields... | Various | May include study title, status, etc. |
+
+**Important Notes**:
+- Clinical Studies are associated with projects but **cannot be identified with any particular year** or fiscal year
+- Linkages come directly from ClinicalTrials.gov where grant numbers are entered during trial registration
+- The join key is `CORE_PROJECT_NUM`, not `project_num`
 
 ---
 
-## ClinicalTrials.gov API Integration
+## Proposed Pipeline Architecture
 
-### API Overview
+### Option 1: Separate ExPORTER Clinical Studies Pipeline
 
-**Base URL**: `https://clinicaltrials.gov/api/v2`
-
-**Key Characteristics**:
-- ✅ Public API (no authentication required)
-- ✅ REST API using OpenAPI 3.0 specification
-- ⚠️ Rate limit: ~50 requests per minute per IP
-- ✅ Supports batch queries for efficiency
-
-### Primary Endpoints
-
-#### 1. Single Study Lookup (by NCT ID)
-```
-GET https://clinicaltrials.gov/api/v2/studies/{NCT_ID}
-```
-
-**Example**:
-```bash
-curl "https://clinicaltrials.gov/api/v2/studies/NCT04267848"
-```
-
-**Response Structure**:
-```json
-{
-  "protocolSection": {
-    "identificationModule": {
-      "nctId": "NCT04267848",
-      "orgStudyIdInfo": {"id": "Protocol-001"},
-      "briefTitle": "Study of Drug X in Cancer Patients"
-    },
-    "statusModule": {
-      "statusVerifiedDate": "2024-01",
-      "overallStatus": "RECRUITING",
-      "startDateStruct": {"date": "2024-01-15"},
-      "completionDateStruct": {"date": "2026-12-31"}
-    },
-    "sponsorCollaboratorsModule": {
-      "leadSponsor": {"name": "University of California"}
-    },
-    "descriptionModule": {
-      "briefSummary": "This study investigates...",
-      "detailedDescription": "Full protocol details..."
-    },
-    "conditionsModule": {
-      "conditions": ["Breast Cancer", "Metastatic Cancer"]
-    },
-    "eligibilityModule": {
-      "eligibilityCriteria": "Inclusion: Age 18+...",
-      "sex": "ALL",
-      "minimumAge": "18 Years",
-      "maximumAge": "N/A"
-    },
-    "designModule": {
-      "studyType": "INTERVENTIONAL",
-      "phases": ["PHASE2"],
-      "designInfo": {
-        "allocation": "RANDOMIZED",
-        "interventionModel": "PARALLEL",
-        "primaryPurpose": "TREATMENT"
-      }
-    },
-    "armsInterventionsModule": {
-      "interventions": [
-        {
-          "type": "DRUG",
-          "name": "Drug X",
-          "description": "Experimental treatment"
-        }
-      ]
-    },
-    "outcomesModule": {
-      "primaryOutcomes": [
-        {
-          "measure": "Overall Survival",
-          "timeFrame": "5 years"
-        }
-      ]
-    },
-    "contactsLocationsModule": {
-      "locations": [
-        {
-          "facility": "UCSF Medical Center",
-          "city": "San Francisco",
-          "state": "California",
-          "country": "United States"
-        }
-      ]
-    }
-  },
-  "resultsSection": {
-    "participantFlowModule": {...},
-    "baselineCharacteristicsModule": {...},
-    "outcomeMeasuresModule": {...}
-  }
-}
-```
-
-#### 2. Batch Studies Query
-```
-GET https://clinicaltrials.gov/api/v2/studies?query.id={NCT_ID1}+OR+{NCT_ID2}
-```
-
-**Example**:
-```bash
-curl "https://clinicaltrials.gov/api/v2/studies?query.id=NCT04267848+OR+NCT03892345&pageSize=100"
-```
-
-#### 3. Search with Filters
-```
-GET https://clinicaltrials.gov/api/v2/studies?query.cond={condition}&query.term={term}
-```
-
----
-
-## Proposed Architecture for Clinical Trials Enrichment
-
-### Option 1: New Data Pipeline (Recommended)
-
-Add a dedicated Clinical Trials pipeline that:
-1. Reads NCT IDs from `nih_reporter_clinical_trials`
-2. Queries ClinicalTrials.gov API
-3. Writes to new silver tables
+Create a new pipeline that:
+1. Downloads the NIH ExPORTER Clinical Studies CSV file
+2. Processes it into a linkage table
+3. Joins with existing NIH Reporter projects
+4. Uses NCT IDs to enrich with ClinicalTrials.gov data
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│            Clinical Trials Pipeline Stack                   │
+│         ExPORTER Clinical Studies Pipeline                  │
 ├─────────────────────────────────────────────────────────────┤
-│  EventBridge Trigger (Weekly, after NIH Reporter)           │
+│  EventBridge Trigger (Weekly)                                │
 │    ↓                                                         │
-│  Lambda: Clinical Trials API Ingestion                      │
-│    ├─ Read NCT IDs from Athena query                        │
-│    ├─ Query ClinicalTrials.gov API (batch mode)            │
-│    ├─ Rate limit: 50 req/min (~3000 trials/hour)           │
-│    └─ Save to S3 Landing Zone (JSONL)                      │
+│  Lambda: Download ExPORTER CSV                               │
+│    ├─ URL: reporter.nih.gov/exporter                        │
+│    ├─ Download CLINICAL_STUDIES.csv                         │
+│    └─ Save to S3 Landing Zone                               │
 │    ↓                                                         │
 │  Glue Bronze Job                                             │
-│    └─ Raw JSON storage with nct_id as key                   │
+│    ├─ Read CSV from landing zone                            │
+│    ├─ Store raw data in Bronze                              │
+│    └─ Deduplicate on (core_project_num, nct_id)            │
 │    ↓                                                         │
 │  Glue Silver Job                                             │
-│    └─ Parse into normalized tables:                         │
-│       ├─ clinical_trials_studies (main table)               │
-│       ├─ clinical_trials_interventions                      │
-│       ├─ clinical_trials_outcomes                           │
-│       ├─ clinical_trials_locations                          │
-│       ├─ clinical_trials_conditions                         │
-│       └─ clinical_trials_sponsors                           │
+│    ├─ Create linkage table: exporter_clinical_studies       │
+│    │  Schema: (core_project_num, nct_id, source_date)       │
+│    └─ Upsert to Iceberg table                               │
+│    ↓                                                         │
+│  Glue Clinical Trials Enrichment Job                         │
+│    ├─ Read unique NCT IDs                                   │
+│    ├─ Query ClinicalTrials.gov API (batch mode)            │
+│    ├─ Rate limit: 50 req/min                                │
+│    └─ Create detailed clinical trials tables                │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Key Implementation Details**:
+### Lambda Function: Download ExPORTER CSV
 
-**Lambda Function** (`clinical_trials_lambda/handler.py`):
 ```python
 import boto3
 import requests
-import time
-from typing import List, Dict
+from datetime import datetime
 
-API_BASE_URL = "https://clinicaltrials.gov/api/v2"
-RATE_LIMIT_DELAY = 1.2  # 50 requests/min = 1.2s per request
+LANDING_ZONE_BUCKET = os.environ['LANDING_ZONE_BUCKET']
+EXPORTER_URL = 'https://reporter.nih.gov/exporter/clinicalstudies/download'
 
 def lambda_handler(event, context):
     """
-    Query ClinicalTrials.gov API for NCT IDs from NIH Reporter.
+    Download NIH ExPORTER Clinical Studies CSV file.
     """
-    # Get NCT IDs from Athena query
-    nct_ids = get_nct_ids_from_athena()
+    # Download CSV
+    response = requests.get(EXPORTER_URL, stream=True, timeout=300)
+    response.raise_for_status()
 
-    # Batch NCT IDs (API supports multiple IDs in one request)
-    batch_size = 100  # Adjust based on API limits
+    # Generate S3 key
+    source_date = datetime.utcnow().strftime('%Y-%m-%d')
+    s3_key = f"exporter_clinical_studies/clinical_studies_{source_date}.csv"
 
-    for i in range(0, len(nct_ids), batch_size):
-        batch = nct_ids[i:i+batch_size]
-        query = "+OR+".join([f"{nct_id}" for nct_id in batch])
+    # Upload to S3
+    s3_client = boto3.client('s3')
+    s3_client.put_object(
+        Bucket=LANDING_ZONE_BUCKET,
+        Key=s3_key,
+        Body=response.content,
+        ContentType='text/csv',
+        Metadata={
+            'source_date': source_date,
+            'source_url': EXPORTER_URL,
+            'ingestion_timestamp': datetime.utcnow().isoformat()
+        }
+    )
 
-        # Query API
-        url = f"{API_BASE_URL}/studies?query.id={query}&pageSize={batch_size}"
-        response = query_api(url)
-
-        # Save to S3
-        save_to_s3(response, batch_num=i//batch_size)
-
-        # Rate limiting
-        time.sleep(RATE_LIMIT_DELAY)
-
-    return {"status": "success", "trials_processed": len(nct_ids)}
-
-def get_nct_ids_from_athena():
-    """Query Athena for unique NCT IDs from NIH Reporter."""
-    athena = boto3.client('athena')
-
-    query = """
-    SELECT DISTINCT nct_id
-    FROM allsci_silver_prod.nih_reporter_clinical_trials
-    WHERE nct_id IS NOT NULL
-    """
-
-    # Execute query and return results
-    # (Implementation details omitted for brevity)
-    return nct_ids
-
-def query_api(url: str, max_retries: int = 3) -> Dict:
-    """Query ClinicalTrials.gov API with retry logic."""
-    for attempt in range(max_retries):
-        try:
-            response = requests.get(url, timeout=30)
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 429:  # Rate limit
-                time.sleep((attempt + 1) * 60)  # Exponential backoff
-                continue
-        except requests.exceptions.RequestException as e:
-            if attempt == max_retries - 1:
-                raise
-    raise Exception(f"API request failed after {max_retries} attempts")
+    return {
+        'status': 'success',
+        's3_path': f"s3://{LANDING_ZONE_BUCKET}/{s3_key}",
+        'source_date': source_date
+    }
 ```
 
-**Silver Layer Tables**:
+### Bronze Glue Job
 
-1. **`clinical_trials_studies`** (Main dimension):
+```python
+from awsglue.context import GlueContext
+from pyspark.context import SparkContext
+from pyspark.sql import functions as F
+
+# Read CSV from landing zone
+df_raw = spark.read.option("header", "true").csv(
+    f"s3://{LANDING_ZONE_BUCKET}/exporter_clinical_studies/*.csv"
+)
+
+# Add metadata
+df_bronze = df_raw.withColumn(
+    "ingestion_datetime", F.current_timestamp()
+).withColumn(
+    "source_date", F.current_date()
+)
+
+# Write to Bronze Iceberg table
+df_bronze.writeTo(f"{BRONZE_DATABASE}.exporter_clinical_studies") \
+    .using("iceberg") \
+    .tableProperty("write.format.default", "parquet") \
+    .tableProperty("write.parquet.compression-codec", "zstd") \
+    .createOrReplace()
+```
+
+### Silver Layer Linkage Table
+
+```python
+# Read from Bronze
+df_bronze = spark.read.table(f"{BRONZE_DATABASE}.exporter_clinical_studies")
+
+# Transform and deduplicate
+df_silver = df_bronze.select(
+    F.col("CORE_PROJECT_NUM").alias("core_project_num"),
+    F.col("CLINICALTRIALS_GOV_ID").alias("nct_id"),  # Adjust field name as needed
+    F.col("source_date"),
+    F.col("ingestion_datetime")
+).filter(
+    F.col("core_project_num").isNotNull() &
+    F.col("nct_id").isNotNull()
+).dropDuplicates(["core_project_num", "nct_id"])
+
+# Create temp view for MERGE
+df_silver.createOrReplaceTempView("upsert_batch")
+
+# MERGE INTO silver table
+spark.sql(f"""
+    MERGE INTO {SILVER_DATABASE}.exporter_clinical_studies AS target
+    USING upsert_batch AS source
+    ON target.core_project_num = source.core_project_num
+       AND target.nct_id = source.nct_id
+    WHEN MATCHED AND source.source_date > target.source_date THEN
+        UPDATE SET *
+    WHEN NOT MATCHED THEN
+        INSERT *
+""")
+```
+
+### Silver Layer Table Schema
+
 ```sql
-CREATE TABLE clinical_trials_studies (
+CREATE TABLE exporter_clinical_studies (
+    core_project_num STRING,
     nct_id STRING,
-    org_study_id STRING,
-    brief_title STRING,
-    official_title STRING,
-    brief_summary STRING,
-    detailed_description STRING,
-    overall_status STRING,  -- RECRUITING, COMPLETED, etc.
-    status_verified_date DATE,
-    study_type STRING,  -- INTERVENTIONAL, OBSERVATIONAL
-    phase STRING,  -- PHASE1, PHASE2, PHASE3, etc.
-    enrollment_count INT,
-    start_date DATE,
-    completion_date DATE,
-    primary_completion_date DATE,
-    lead_sponsor_name STRING,
-    lead_sponsor_class STRING,
-    responsible_party_type STRING,
-    allocation STRING,  -- RANDOMIZED, NON_RANDOMIZED
-    intervention_model STRING,  -- PARALLEL, CROSSOVER, etc.
-    primary_purpose STRING,  -- TREATMENT, PREVENTION, etc.
-    masking STRING,
     source_date DATE,
     ingestion_datetime TIMESTAMP
 ) USING iceberg
-PARTITIONED BY (months(start_date))
+PARTITIONED BY (months(source_date))
+TBLPROPERTIES (
+    'write.format.default' = 'parquet',
+    'write.parquet.compression-codec' = 'zstd'
+)
 ```
-
-2. **`clinical_trials_conditions`** (Bridge table):
-```sql
-CREATE TABLE clinical_trials_conditions (
-    nct_id STRING,
-    condition STRING,
-    source_date DATE,
-    ingestion_datetime TIMESTAMP
-) USING iceberg
-```
-
-3. **`clinical_trials_interventions`**:
-```sql
-CREATE TABLE clinical_trials_interventions (
-    nct_id STRING,
-    intervention_type STRING,  -- DRUG, DEVICE, PROCEDURE, etc.
-    intervention_name STRING,
-    description STRING,
-    source_date DATE,
-    ingestion_datetime TIMESTAMP
-) USING iceberg
-```
-
-4. **`clinical_trials_locations`**:
-```sql
-CREATE TABLE clinical_trials_locations (
-    nct_id STRING,
-    facility STRING,
-    city STRING,
-    state STRING,
-    country STRING,
-    zip_code STRING,
-    status STRING,  -- RECRUITING, etc.
-    source_date DATE,
-    ingestion_datetime TIMESTAMP
-) USING iceberg
-```
-
-5. **`clinical_trials_outcomes`**:
-```sql
-CREATE TABLE clinical_trials_outcomes (
-    nct_id STRING,
-    outcome_type STRING,  -- PRIMARY, SECONDARY
-    measure STRING,
-    time_frame STRING,
-    description STRING,
-    source_date DATE,
-    ingestion_datetime TIMESTAMP
-) USING iceberg
-```
-
-6. **`clinical_trials_eligibility`**:
-```sql
-CREATE TABLE clinical_trials_eligibility (
-    nct_id STRING,
-    eligibility_criteria STRING,
-    sex STRING,
-    minimum_age STRING,
-    maximum_age STRING,
-    healthy_volunteers STRING,
-    source_date DATE,
-    ingestion_datetime TIMESTAMP
-) USING iceberg
-```
-
-### Option 2: Extend Existing NIH Reporter Pipeline
-
-Add a new Glue job to the existing Step Functions workflow:
-
-```
-Lambda (NIH Reporter)
-  → Bronze Job
-  → Silver Job
-  → NEW: Clinical Trials Enrichment Job (queries API based on NCT IDs)
-  → Success
-```
-
-**Pros**: Reuses existing infrastructure
-**Cons**: Couples two different data sources; harder to maintain
 
 ---
 
-## Joining NIH Reporter + Clinical Trials Data
+## Joining NIH Reporter Projects with Clinical Trials
 
-Once clinical trials data is in the silver layer, you can join it with NIH Reporter:
+### SQL Query Example
 
 ```sql
--- Get NIH grants with their associated clinical trials
+-- Get NIH projects with their associated clinical trials
 SELECT
     p.project_num,
+    p.core_project_num,
     p.project_title,
     p.fiscal_year,
     p.award_amount,
     org.org_name,
-    ct_link.nct_id,
+    org.org_state,
+    cs.nct_id,
     ct.brief_title AS trial_title,
     ct.overall_status AS trial_status,
     ct.phase AS trial_phase,
     ct.enrollment_count,
-    ct.start_date AS trial_start_date
+    ct.start_date AS trial_start_date,
+    ct.lead_sponsor_name
 FROM
     allsci_silver_prod.nih_reporter_projects p
-    JOIN allsci_silver_prod.nih_reporter_clinical_trials ct_link
-        ON p.project_num = ct_link.project_num
-        AND p.fiscal_year = ct_link.fiscal_year
-    JOIN allsci_silver_prod.clinical_trials_studies ct
-        ON ct_link.nct_id = ct.nct_id
-    JOIN allsci_silver_prod.nih_reporter_organizations org
+    -- Join with ExPORTER Clinical Studies linkage table
+    INNER JOIN allsci_silver_prod.exporter_clinical_studies cs
+        ON p.core_project_num = cs.core_project_num
+    -- Join with enriched clinical trials data
+    LEFT JOIN allsci_silver_prod.clinical_trials_studies ct
+        ON cs.nct_id = ct.nct_id
+    -- Join with organization info
+    LEFT JOIN allsci_silver_prod.nih_reporter_organizations org
         ON p.project_num = org.project_num
 WHERE
-    p.fiscal_year = 2024
-    AND ct.overall_status = 'RECRUITING'
-ORDER BY
-    p.award_amount DESC;
-```
-
-**Example Analysis - Find trials by condition**:
-```sql
-SELECT
-    p.project_num,
-    p.project_title,
-    p.award_amount,
-    cond.condition,
-    ct.brief_title,
-    ct.overall_status,
-    loc.facility,
-    loc.city,
-    loc.state
-FROM
-    allsci_silver_prod.nih_reporter_projects p
-    JOIN allsci_silver_prod.nih_reporter_clinical_trials ct_link
-        ON p.project_num = ct_link.project_num
-    JOIN allsci_silver_prod.clinical_trials_studies ct
-        ON ct_link.nct_id = ct.nct_id
-    JOIN allsci_silver_prod.clinical_trials_conditions cond
-        ON ct.nct_id = cond.nct_id
-    LEFT JOIN allsci_silver_prod.clinical_trials_locations loc
-        ON ct.nct_id = loc.nct_id
-WHERE
-    cond.condition LIKE '%Cancer%'
-    AND ct.phase IN ('PHASE2', 'PHASE3')
-    AND p.fiscal_year >= 2023
+    p.fiscal_year >= 2023
+    AND ct.overall_status IN ('RECRUITING', 'ACTIVE_NOT_RECRUITING', 'ENROLLING_BY_INVITATION')
 ORDER BY
     p.award_amount DESC
 LIMIT 100;
 ```
 
----
+### Important Note About the Join Key
 
-## Implementation Roadmap
-
-### Phase 1: Data Discovery (Current)
-- ✅ Understand NCT ID availability in NIH Reporter
-- ✅ Explore ClinicalTrials.gov API
-- ✅ Design silver layer schema
-
-### Phase 2: Pipeline Development
-1. Create new CDK stack for Clinical Trials pipeline
-2. Implement Lambda function for API ingestion
-3. Create Bronze Glue job (raw JSON storage)
-4. Create Silver Glue job with transformations
-5. Add to Step Functions workflow
-
-### Phase 3: Testing & Validation
-1. Test with sample NCT IDs
-2. Validate data quality
-3. Check for missing/invalid NCT IDs
-4. Performance testing (handle ~10K+ trials)
-
-### Phase 4: Production Deployment
-1. Deploy to dev environment
-2. Run full historical load
-3. Deploy to prod
-4. Set up monitoring/alerting
-
-### Phase 5: Analytics & Gold Layer
-1. Create gold layer dimensional model
-2. Join NIH grants + clinical trials + publications
-3. Build unified research analytics
+**Use `core_project_num`, NOT `project_num`**:
+- `core_project_num` is the base grant identifier (e.g., `R01CA123456`)
+- `project_num` includes suffixes for specific years (e.g., `5R01CA123456-05`)
+- ExPORTER Clinical Studies links on `core_project_num` because trials span multiple years
 
 ---
 
-## Key Considerations
+## Implementation Steps
 
-### 1. Data Freshness
-- **NIH Reporter**: Updated weekly
-- **ClinicalTrials.gov**: Updated continuously
-- **Recommendation**: Run clinical trials pipeline weekly after NIH Reporter
+### Phase 1: Verify ExPORTER Access
+```bash
+# Test downloading the ExPORTER Clinical Studies file
+curl -O "https://reporter.nih.gov/exporter/clinicalstudies/download"
 
-### 2. NCT ID Validation
-- Not all NIH projects have clinical trials
-- NCT IDs can become invalid (withdrawn studies)
-- Handle API 404 errors gracefully
-
-### 3. Rate Limiting Strategy
-```python
-# Batch approach to stay under 50 req/min
-BATCH_SIZE = 100  # NCT IDs per request
-RATE_LIMIT_DELAY = 1.2  # seconds (50 req/min)
-
-# For ~10,000 NCT IDs:
-# 10,000 / 100 = 100 batches
-# 100 batches * 1.2s = 120 seconds (~2 minutes)
+# Examine the file structure
+head -20 clinical_studies.csv
 ```
 
-### 4. Data Volumes
-Estimated from current NIH Reporter data:
-- Total unique NCT IDs: ~10,000-15,000
-- API response size: ~50-100 KB per trial
-- Total raw data: ~500 MB - 1.5 GB
-- Silver layer (normalized): ~200 MB - 500 MB
+### Phase 2: Understand the Schema
+- Open the downloaded CSV
+- Identify exact field names (they may vary from documentation)
+- Note: Field names might be different than expected:
+  - `CORE_PROJECT_NUM` vs `Core_Project_Num`
+  - `NCT_ID` vs `CLINICALTRIALS_GOV_ID` vs `ClinicalTrials_gov_ID`
 
-### 5. Cost Estimation (AWS)
-- Lambda executions: ~100-200 invocations/week = $0.02/month
-- S3 storage: ~1 GB = $0.023/month
-- Glue job runs: 2 jobs * 0.5 DPU-hours = $1.00/week = $4/month
-- Athena queries: ~10 GB scanned/week = $0.50/month
-- **Total**: ~$5-6/month
+### Phase 3: Validate Linkage Coverage
+```sql
+-- Count how many NIH projects have clinical trials
+SELECT
+    COUNT(DISTINCT p.core_project_num) AS total_projects,
+    COUNT(DISTINCT cs.core_project_num) AS projects_with_trials,
+    ROUND(COUNT(DISTINCT cs.core_project_num) * 100.0 / COUNT(DISTINCT p.core_project_num), 2) AS coverage_pct
+FROM
+    allsci_silver_prod.nih_reporter_projects p
+    LEFT JOIN allsci_silver_prod.exporter_clinical_studies cs
+        ON p.core_project_num = cs.core_project_num;
+```
+
+### Phase 4: Build Pipeline
+1. Create Lambda for ExPORTER CSV download
+2. Create Bronze Glue job
+3. Create Silver Glue job for linkage table
+4. Test with sample data
+5. Full historical load
+6. Schedule weekly updates
+
+### Phase 5: Enrich with ClinicalTrials.gov API
+- Use NCT IDs from linkage table
+- Query ClinicalTrials.gov API v2
+- Build detailed clinical trials tables (see original doc for API details)
 
 ---
 
-## Sample Code: Lambda Handler (Production-Ready)
+## Fixing Your Current Pipeline Code
 
-See separate file: `clinical_trials_lambda/handler.py`
+### Option A: Remove the Clinical Trials Transformer (Recommended)
+
+Since the `clinical_trials` field doesn't exist in the Projects API, remove it from the pipeline:
+
+**File**: `nih_reporter/glue/package/lake_tools/catalogs.py`
+
+```python
+class TransformationCatalog(Catalog):
+    def __init__(self):
+        super().__init__()
+        self.catalog = {
+            "nih_reporter_projects": NihReporterProjects,
+            "nih_reporter_organizations": NihReporterOrganizations,
+            "nih_reporter_principal_investigators": NihReporterPrincipalInvestigators,
+            "nih_reporter_program_officers": NihReporterProgramOfficers,
+            "nih_reporter_publications": NihReporterPublications,
+            # "nih_reporter_clinical_trials": NihReporterClinicalTrials,  # ← REMOVE THIS
+            "nih_reporter_agencies_admin": NihReporterAgenciesAdmin,
+            "nih_reporter_agencies_funding": NihReporterAgenciesFunding,
+            "nih_reporter_spending_categories": NihReporterSpendingCategories,
+            "nih_reporter_terms": NihReporterTerms,
+            "nih_reporter_study_sections": NihReporterStudySections,
+        }
+```
+
+**File**: `nih_reporter/glue/jobs/nih_reporter_silver.py`
+
+```python
+# Process each silver table using TransformationCatalog
+for table in (
+    "nih_reporter_projects",
+    "nih_reporter_organizations",
+    "nih_reporter_principal_investigators",
+    "nih_reporter_program_officers",
+    "nih_reporter_publications",
+    # "nih_reporter_clinical_trials",  # ← REMOVE THIS
+    "nih_reporter_agencies_admin",
+    "nih_reporter_agencies_funding",
+    "nih_reporter_spending_categories",
+    "nih_reporter_terms",
+    "nih_reporter_study_sections",
+):
+    # ... processing code
+```
+
+### Option B: Test If Field Exists
+
+Add logic to check if the field actually exists in the API response:
+
+```python
+# In the Lambda handler, check a sample response
+sample_response = query_api({"criteria": {"fiscal_years": [2024]}, "limit": 1})
+if sample_response['results']:
+    sample_project = sample_response['results'][0]
+    if 'clinical_trials' in sample_project:
+        logger.info("✓ clinical_trials field exists in API response")
+    else:
+        logger.warning("✗ clinical_trials field NOT found in API response")
+        logger.info("Available fields: " + ", ".join(sample_project.keys()))
+```
 
 ---
 
-## References & Resources
+## Data Dictionary References
 
-### NIH Reporter
-- API Documentation: https://api.reporter.nih.gov/
-- Current implementation: `data-pipelines/allsci-data-pipelines/nih_reporter/`
-- Clinical trials field mapping: Line 139-144 in `docs/api_fields_mapping.md`
+### NIH ExPORTER
+- **Main Page**: https://reporter.nih.gov/exporter
+- **Data Dictionary**: https://report.nih.gov/exporter-data-dictionary
+- **FAQ**: https://exporter.nih.gov/faq.aspx
 
 ### ClinicalTrials.gov API
-- [ClinicalTrials.gov API Documentation](https://clinicaltrials.gov/data-api/api)
+- **API Documentation**: https://clinicaltrials.gov/data-api/api
+- **API v2 Release Notes**: https://www.nlm.nih.gov/pubs/techbull/ma24/ma24_clinicaltrials_api.html
+
+### NIH Reporter
+- **Projects API**: https://api.reporter.nih.gov/
+- **Data Elements PDF**: https://api.reporter.nih.gov/documents/Data%20Elements%20for%20RePORTER%20Project%20API_V2.pdf
+
+---
+
+## Key Differences from Original Document
+
+| Original Assumption | Corrected Understanding |
+|---------------------|-------------------------|
+| `clinical_trials` field in Projects API | Field may not exist; use ExPORTER instead |
+| Join on `project_num` | Join on `core_project_num` |
+| Data embedded in project responses | Data in separate ExPORTER CSV file |
+| Query API for each project | Download bulk CSV file weekly |
+| Linkage by fiscal year | Linkage **not** tied to specific year |
+
+---
+
+## Recommended Next Steps
+
+1. **Download a sample ExPORTER Clinical Studies CSV** to examine the actual schema
+2. **Check your current pipeline** to see if `nih_reporter_clinical_trials` table has any data
+3. **Build the ExPORTER Clinical Studies pipeline** following the architecture above
+4. **Verify linkage quality** by joining on `core_project_num`
+5. **Enrich with ClinicalTrials.gov API** to get detailed trial information
+
+---
+
+## References & Sources
+
+### NIH ExPORTER
+- [NIH ExPORTER Main Page](https://reporter.nih.gov/exporter)
+- [ExPORTER Data Dictionary](https://report.nih.gov/exporter-data-dictionary)
+- [ExPORTER FAQ](https://exporter.nih.gov/faq.aspx)
+- [Federal RePORTER File Download](https://federalreporter.nih.gov/FileDownload)
+
+### Documentation
+- [NIH RePORTER FAQ about Clinical Studies](https://report.nih.gov/faqs)
+- [GitHub: rnabioco/nihexporter R Package](https://github.com/rnabioco/nihexporter)
+- [GitHub: nih_project_data Analysis](https://github.com/mrtoronto/nih_project_data)
+
+### ClinicalTrials.gov
+- [ClinicalTrials.gov API v2](https://clinicaltrials.gov/data-api/api)
 - [NLM Technical Bulletin on API v2](https://www.nlm.nih.gov/pubs/techbull/ma24/ma24_clinicaltrials_api.html)
-- [BioMCP ClinicalTrials.gov Guide](https://biomcp.org/backend-services-reference/04-clinicaltrials-gov/)
-- [Stack Overflow: ClinicalTrials API in Python](https://stackoverflow.com/questions/78415818/how-to-get-full-results-with-clinicaltrials-gov-api-in-python)
-
-### Related Tools
-- [GitHub: ClinicalTrials.gov MCP Server](https://github.com/cyanheads/clinicaltrialsgov-mcp-server)
-- [CRAN: clintrialx R Package](https://cran.r-universe.dev/clintrialx/doc/manual.html)
 
 ---
 
-## Next Steps
-
-1. **Validate NCT ID Coverage**: Query your current silver layer to understand:
-   ```sql
-   SELECT
-       COUNT(DISTINCT project_num) AS total_projects,
-       COUNT(DISTINCT nct_id) AS total_clinical_trials,
-       COUNT(DISTINCT project_num) /
-         (SELECT COUNT(DISTINCT project_num)
-          FROM allsci_silver_prod.nih_reporter_projects) * 100 AS pct_with_trials
-   FROM allsci_silver_prod.nih_reporter_clinical_trials;
-   ```
-
-2. **Test API Access**: Verify ClinicalTrials.gov API is accessible from your AWS environment
-
-3. **Design Review**: Review proposed schema with stakeholders
-
-4. **Prototype**: Build minimal Lambda + Bronze job to prove concept
-
-5. **Implement**: Full pipeline development following existing NIH Reporter patterns
-
----
-
-**Document Version**: 1.0
+**Document Version**: 2.0 (CORRECTED)
 **Last Updated**: 2025-12-04
 **Author**: Claude Code
