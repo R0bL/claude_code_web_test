@@ -1,0 +1,50 @@
+{
+  "globenewswire": {
+    "description": "GlobeNewswire RSS feeds for biotechnology and pharmaceutical news",
+    "base_url": "https://www.globenewswire.com",
+    "rss_list_url": "https://www.globenewswire.com/rss/list",
+    "feeds": {
+      "clinical_study": {
+        "url": "https://www.globenewswire.com/RssFeed/subjectcode/90-Clinical%20Study/feedTitle/GlobeNewswire%20-%20Clinical%20Study",
+        "description": "Clinical study news and press releases"
+      },
+      "biotechnology": {
+        "url": "https://www.globenewswire.com/RssFeed/industry/1-Biotechnology/feedTitle/GlobeNewswire%20-%20Biotechnology",
+        "description": "Biotechnology industry news"
+      },
+      "pharmaceuticals": {
+        "url": "https://www.globenewswire.com/RssFeed/industry/2-Pharmaceuticals/feedTitle/GlobeNewswire%20-%20Pharmaceuticals",
+        "description": "Pharmaceutical industry news"
+      }
+    }
+  },
+  "prnewswire": {
+    "description": "PR Newswire RSS feeds for health, biotechnology and pharmaceutical news",
+    "base_url": "https://www.prnewswire.com",
+    "rss_list_url": "https://www.prnewswire.com/rss/",
+    "feeds": {
+      "biotechnology": {
+        "url": "https://www.prnewswire.com/rss/health-latest-news/biotechnology-list.rss",
+        "description": "Biotechnology news and press releases",
+        "note": "URL pattern may need verification - check https://www.prnewswire.com/rss/ for exact feed URLs"
+      },
+      "pharmaceuticals": {
+        "url": "https://www.prnewswire.com/rss/health-latest-news/pharmaceuticals-list.rss",
+        "description": "Pharmaceutical news and press releases",
+        "note": "URL pattern may need verification - check https://www.prnewswire.com/rss/ for exact feed URLs"
+      },
+      "healthcare": {
+        "url": "https://www.prnewswire.com/rss/health-latest-news.rss",
+        "description": "General healthcare news",
+        "note": "URL pattern may need verification - check https://www.prnewswire.com/rss/ for exact feed URLs"
+      }
+    }
+  },
+  "notes": [
+    "GlobeNewswire feed URLs have been verified from user input",
+    "PR Newswire feed URLs follow assumed patterns based on web structure - may need adjustment",
+    "Both services offer RSS feeds in XML format",
+    "No API keys required for RSS access",
+    "Consider implementing rate limiting and caching for production use"
+  ]
+}
