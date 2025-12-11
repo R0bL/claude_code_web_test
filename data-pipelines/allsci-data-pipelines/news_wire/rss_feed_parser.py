@@ -6,10 +6,17 @@ Fetches and parses RSS feeds from GlobeNewswire and PR Newswire for biotechnolog
 import feedparser
 import json
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import requests
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 import time
+import re
+try:
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
+except ImportError:
+    BS4_AVAILABLE = False
+    print("Warning: BeautifulSoup4 not available. Article content extraction will be disabled.")
 
 
 @dataclass
@@ -23,6 +30,9 @@ class NewsArticle:
     categories: List[str]
     author: str = ""
     guid: str = ""
+    full_content: Optional[str] = None
+    content_html: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
     raw_data: Dict[str, Any] = None
 
     def to_dict(self):
@@ -48,9 +58,16 @@ class NewsWireRSSParser:
         "healthcare": "https://www.prnewswire.com/rss/health-latest-news.rss",
     }
 
-    def __init__(self, user_agent: str = "NewsWireParser/1.0"):
-        """Initialize the parser."""
+    def __init__(self, user_agent: str = "NewsWireParser/1.0", fetch_full_content: bool = False):
+        """
+        Initialize the parser.
+
+        Args:
+            user_agent: User agent string for HTTP requests
+            fetch_full_content: If True, fetch full article content from HTML pages
+        """
         self.user_agent = user_agent
+        self.fetch_full_content = fetch_full_content
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": user_agent})
 
@@ -88,6 +105,158 @@ class NewsWireRSSParser:
                     raise
 
         return None
+
+    def fetch_article_content(self, url: str, max_retries: int = 3) -> Optional[Dict[str, Any]]:
+        """
+        Fetch full article content from article URL.
+
+        Args:
+            url: Article URL
+            max_retries: Maximum number of retry attempts
+
+        Returns:
+            Dictionary with full_content, content_html, and metadata
+        """
+        if not BS4_AVAILABLE:
+            return None
+
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(url, timeout=30)
+                response.raise_for_status()
+
+                soup = BeautifulSoup(response.content, 'html.parser')
+
+                # Determine source and parse accordingly
+                if "globenewswire.com" in url:
+                    return self._parse_globenewswire_article(soup, url)
+                elif "prnewswire.com" in url:
+                    return self._parse_prnewswire_article(soup, url)
+                else:
+                    return None
+
+            except requests.exceptions.RequestException as e:
+                print(f"Attempt {attempt + 1}/{max_retries} failed for {url}: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    print(f"Failed to fetch article content from {url}")
+                    return None
+
+        return None
+
+    def _parse_globenewswire_article(self, soup: BeautifulSoup, url: str) -> Dict[str, Any]:
+        """
+        Parse GlobeNewswire article HTML.
+
+        Args:
+            soup: BeautifulSoup object
+            url: Article URL
+
+        Returns:
+            Dictionary with content and metadata
+        """
+        result = {
+            "full_content": "",
+            "content_html": "",
+            "metadata": {}
+        }
+
+        # Extract main article content
+        # GlobeNewswire typically uses div with class 'article-body' or similar
+        article_body = soup.find('div', class_='article-body')
+        if not article_body:
+            article_body = soup.find('div', id='article-body')
+        if not article_body:
+            # Try to find the main content area
+            article_body = soup.find('article')
+
+        if article_body:
+            # Get HTML content
+            result["content_html"] = str(article_body)
+
+            # Get plain text content
+            # Remove script and style elements
+            for script in article_body(["script", "style"]):
+                script.decompose()
+
+            text = article_body.get_text(separator='\n', strip=True)
+            result["full_content"] = text
+
+        # Extract metadata
+        # Company name
+        company = soup.find('meta', {'property': 'og:site_name'})
+        if company:
+            result["metadata"]["company"] = company.get('content', '')
+
+        # Publication date
+        pub_date = soup.find('meta', {'property': 'article:published_time'})
+        if pub_date:
+            result["metadata"]["published_time"] = pub_date.get('content', '')
+
+        # Author/contributor
+        author = soup.find('span', class_='article-author')
+        if author:
+            result["metadata"]["author"] = author.get_text(strip=True)
+
+        # Extract any contact information
+        contact_section = soup.find('div', class_='contact-info')
+        if contact_section:
+            result["metadata"]["contact"] = contact_section.get_text(strip=True)
+
+        return result
+
+    def _parse_prnewswire_article(self, soup: BeautifulSoup, url: str) -> Dict[str, Any]:
+        """
+        Parse PR Newswire article HTML.
+
+        Args:
+            soup: BeautifulSoup object
+            url: Article URL
+
+        Returns:
+            Dictionary with content and metadata
+        """
+        result = {
+            "full_content": "",
+            "content_html": "",
+            "metadata": {}
+        }
+
+        # Extract main article content
+        # PR Newswire uses different class names
+        article_body = soup.find('div', class_='release-body')
+        if not article_body:
+            article_body = soup.find('section', class_='release')
+        if not article_body:
+            article_body = soup.find('article')
+
+        if article_body:
+            # Get HTML content
+            result["content_html"] = str(article_body)
+
+            # Get plain text content
+            for script in article_body(["script", "style"]):
+                script.decompose()
+
+            text = article_body.get_text(separator='\n', strip=True)
+            result["full_content"] = text
+
+        # Extract metadata
+        company = soup.find('meta', {'property': 'og:site_name'})
+        if company:
+            result["metadata"]["company"] = company.get('content', '')
+
+        pub_date = soup.find('meta', {'property': 'article:published_time'})
+        if pub_date:
+            result["metadata"]["published_time"] = pub_date.get('content', '')
+
+        # Extract dateline (location and date info)
+        dateline = soup.find('p', class_='mb-no')
+        if dateline:
+            result["metadata"]["dateline"] = dateline.get_text(strip=True)
+
+        return result
 
     def parse_feed_entries(self, feed: feedparser.FeedParserDict, source: str) -> List[NewsArticle]:
         """
@@ -139,6 +308,17 @@ class NewsWireRSSParser:
                 guid=guid,
                 raw_data=dict(entry)
             )
+
+            # Optionally fetch full article content
+            if self.fetch_full_content:
+                article_url = entry.get("link", "")
+                if article_url:
+                    print(f"  Fetching content for: {article.title[:60]}...")
+                    content_data = self.fetch_article_content(article_url)
+                    if content_data:
+                        article.full_content = content_data.get("full_content", "")
+                        article.content_html = content_data.get("content_html", "")
+                        article.metadata = content_data.get("metadata", {})
 
             articles.append(article)
 
@@ -265,11 +445,21 @@ def main():
         default="news_articles.json",
         help="Output JSON file path"
     )
+    parser.add_argument(
+        "--full-content",
+        action="store_true",
+        help="Fetch full article content from HTML pages (requires BeautifulSoup4)"
+    )
 
     args = parser.parse_args()
 
+    # Check if full content fetching is requested but BeautifulSoup4 is not available
+    if args.full_content and not BS4_AVAILABLE:
+        print("Error: --full-content requires BeautifulSoup4. Install with: pip install beautifulsoup4")
+        return
+
     # Initialize parser
-    rss_parser = NewsWireRSSParser()
+    rss_parser = NewsWireRSSParser(fetch_full_content=args.full_content)
 
     # Fetch articles based on source
     if args.source == "globenewswire":

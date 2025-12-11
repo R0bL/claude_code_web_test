@@ -13,6 +13,8 @@ This tool provides a Python-based RSS feed parser for fetching news articles fro
 
 - ✅ Fetch RSS feeds from multiple news wire services
 - ✅ Parse articles into structured data format
+- ✅ **Fetch full article content from HTML pages**
+- ✅ Extract metadata (company, dates, contact info)
 - ✅ Export to JSON for further processing
 - ✅ Retry logic with exponential backoff
 - ✅ Support for filtering by feed type
@@ -61,13 +63,38 @@ python rss_feed_parser.py --source globenewswire --type clinical_study
 python rss_feed_parser.py --output biotech_news.json
 ```
 
+### Fetch Full Article Content
+
+By default, the parser only fetches RSS summaries. To fetch the full article content from HTML pages:
+
+```bash
+# Fetch full content for all articles
+python rss_feed_parser.py --full-content
+
+# Fetch full content for specific source/type
+python rss_feed_parser.py --source globenewswire --type clinical_study --full-content
+```
+
+**Note**: Full content fetching requires BeautifulSoup4. Install with: `pip install beautifulsoup4`
+
+### Fetch Single Article
+
+To fetch content from a single article URL:
+
+```bash
+python fetch_single_article.py "https://www.globenewswire.com/news-release/2025/12/11/3203862/0/en/ViroMissile-Announces-First-in-Human-Phase-I-Trial-of-IDOV-Immune-for-Advanced-Solid-Tumors.html"
+```
+
 ### Programmatic Usage
 
 ```python
 from rss_feed_parser import NewsWireRSSParser
 
-# Initialize parser
+# Initialize parser (without full content)
 parser = NewsWireRSSParser()
+
+# Initialize with full content fetching
+parser_full = NewsWireRSSParser(fetch_full_content=True)
 
 # Fetch from all sources
 articles = parser.fetch_all()
@@ -75,8 +102,8 @@ articles = parser.fetch_all()
 # Fetch only from GlobeNewswire
 articles = parser.fetch_globenewswire()
 
-# Fetch specific feed type
-articles = parser.fetch_globenewswire(feed_type="biotechnology")
+# Fetch specific feed type with full content
+articles = parser_full.fetch_globenewswire(feed_type="clinical_study")
 
 # Save to JSON
 parser.save_to_json(articles, "output.json")
@@ -88,7 +115,18 @@ for article in articles:
     print(f"Published: {article.published}")
     print(f"Source: {article.source}")
     print(f"Summary: {article.summary}")
+
+    # If full content was fetched
+    if article.full_content:
+        print(f"Full content length: {len(article.full_content)} chars")
+        print(f"Metadata: {article.metadata}")
     print("---")
+
+# Fetch single article content
+content_data = parser.fetch_article_content("https://www.globenewswire.com/news-release/...")
+if content_data:
+    print(content_data["full_content"])
+    print(content_data["metadata"])
 ```
 
 ## Available RSS Feeds
@@ -146,11 +184,19 @@ Each article contains:
 - `title`: Article headline
 - `link`: Full URL to the press release
 - `published`: Publication date/time
-- `summary`: Article summary or description
+- `summary`: Article summary or description (from RSS)
 - `source`: Source identifier (e.g., "GlobeNewswire-biotechnology")
 - `categories`: List of tags/categories
 - `author`: Author or company name
 - `guid`: Unique article identifier
+- `full_content`: **Full article text content** (when `fetch_full_content=True`)
+- `content_html`: **Full article HTML** (when `fetch_full_content=True`)
+- `metadata`: **Additional metadata** extracted from article page:
+  - `company`: Company name
+  - `published_time`: Precise publication timestamp
+  - `author`: Article author
+  - `contact`: Contact information
+  - `dateline`: Location and date info (PR Newswire)
 - `raw_data`: Complete raw RSS entry data
 
 ## Integration with AWS Data Pipeline
