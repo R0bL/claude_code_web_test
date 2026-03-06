@@ -138,7 +138,9 @@ The HKEX JSON endpoint returns data in this format:
 
 ## Announcement Categories
 
-Common categories found in HKEX announcements:
+HKEX uses a two-tier headline category system defined in [Appendix 24 of the Listing Rules](https://en-rules.hkex.com.hk/rulebook/headline-categories-1).
+
+### Tier-1 Document Types
 
 | Category | Description |
 |----------|-------------|
@@ -148,7 +150,22 @@ Common categories found in HKEX announcements:
 | Listing Documents | IPO and listing documents |
 | Monthly Returns | Monthly return filings |
 | Next Day Disclosure Returns | Post-trade disclosure returns |
+| Debt and Structured Products | Bond and structured product filings |
 | Trading Information | Trading halts, resumptions |
+
+### Key Tier-2 Sub-Categories (within Announcements and Notices)
+
+| Sub-Category | Relevance |
+|-------------|-----------|
+| Inside Information | Material non-public information disclosures |
+| Final/Interim/Quarterly Results | Financial performance |
+| Profit Warning | Earnings alerts |
+| Connected Transaction | Related-party dealings |
+| Suspension / Resumption | Trading status changes |
+| Rights Issue / Placing | Capital raising |
+| Change of Directors | Board changes |
+
+Full headline categories index: [PDF](https://www2.hkexnews.hk/-/media/HKEXnews/Homepage/Listed-Company-Publications/Search-Guide/HeadlineCategoriesIndex_e.pdf)
 
 ## Finding Biotech/Pharma Companies
 
@@ -166,18 +183,24 @@ BIOTECH_STOCK_CODES = [
     "06160",  # BeiGene
     "09926",  # Akeso
     "09995",  # RemeGen
-    "02162",  # Keymed Biosciences (康诺亚)
+    "02162",  # Keymed Biosciences
     "06978",  # Imeik Technology Development
     "01801",  # Innovent Biologics
     "09969",  # InnoCare Pharma
     "09688",  # Zai Lab
-    "02142",  # Hepion Pharmaceuticals
     "09939",  # Kintor Pharmaceutical
     "03692",  # Hansoh Pharmaceutical
 ]
 
 filtered = parser.filter_by_stock_code(announcements, BIOTECH_STOCK_CODES)
 ```
+
+**Finding more biotech stock codes:**
+- **Chapter 18A "B" marker**: Pre-revenue biotech companies listed under Chapter 18A rules have a "B" marker in their stock name
+- **Hang Seng Biotech Index**: Tracks 30 largest biotech/pharma/medtech companies on HKEX
+- **CES HK Biotechnology Index**: Another index of HK-listed biotech companies
+- **HKEX Biotech listing page**: [hkex.com.hk/Listing/Rules-and-Guidance/Listing-of-Biotech-Companies](https://www.hkex.com.hk/Listing/Rules-and-Guidance/Listing-of-Biotech-Companies?sc_lang=en)
+- **Securities list Excel**: [ListOfSecurities.xlsx](https://www.hkex.com.hk/eng/services/trading/securities/securitieslists/ListOfSecurities.xlsx)
 
 ### Option 2: Filter by Keywords
 
@@ -206,9 +229,15 @@ filtered = parser.filter_by_keywords(announcements, biotech_keywords)
 - Web-based search at [hkexnews.hk/search/titlesearch.xhtml](https://www1.hkexnews.hk/search/titlesearch.xhtml)
 - Supports filtering by stock code, date range, and document type
 
-### 4. Third-Party Data Vendors
-- **LSEG (Refinitiv)**: Real-time HKEX data feeds
+### 4. HKEX Data Marketplace
+- Paid historical data products at [data.hkex.com.hk/catalog](https://data.hkex.com.hk/catalog)
+- Includes a [Programmatic Download API](https://www.hkex.com.hk/-/media/HKEX-Market/Global/Exchange/FAQ/Market-Data/Getting-Market-Data/Historical-Data/Programmatic-Download-API-Interface-Specification-v1,-d-,0.pdf) (for market data, not announcements)
+
+### 5. Third-Party Data Vendors
+- **LSEG (Refinitiv)**: Redistributes HKEX IIS feed; real-time streaming
 - **FactSet Global Filings API**: Includes HKEX filings
+- **AASTOCKS**: Free web aggregator at [aastocks.com/en/lci/listconews.aspx](https://www.aastocks.com/en/lci/listconews.aspx)
+- **Twelve Data**: Commercial API with HKEX data
 
 ## Important Notes
 
