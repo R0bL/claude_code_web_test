@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg
+*.egg-info/
+hkex_announcements.json
+*.log
